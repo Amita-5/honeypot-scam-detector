@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import {
   Message,
@@ -16,9 +16,11 @@ import {
 } from './services/geminiService';
 import {
   EVALUATION_ENDPOINT,
-  DEFAULT_HUMAN_PERSONA,
   DEFAULT_NON_SCAM_REPLY,
   AGENT_PERSONA_DESCRIPTION,
+  HONEYPOT_EXTERNAL_API_PATH,
+  HONEYPOT_API_KEY_HEADER,
+  HONEYPOT_DEV_API_KEY,
 } from './constants';
 import ConversationDisplay from './components/ConversationDisplay';
 import ChatInput from './components/ChatInput';
@@ -40,7 +42,6 @@ const App: React.FC = () => {
     const savedSession = localStorage.getItem('honeypotSession');
     if (savedSession) {
       const parsedSession = JSON.parse(savedSession);
-      // Ensure all fields are present and extractedIntelligence is initialized
       return {
         ...parsedSession,
         extractedIntelligence: parsedSession.extractedIntelligence || createEmptyIntelligence(),
@@ -68,65 +69,163 @@ const App: React.FC = () => {
     localStorage.setItem('honeypotSession', JSON.stringify(session));
   }, [session]);
 
-  const handleIncomingMessage = useCallback(async (scammerMessageText: string): Promise<OutgoingResponsePayload> => {
+  // Core logic for processing an incoming message and generating a response
+  const processHoneypotLogic = useCallback(async (
+    currentSession: HoneypotSession,
+    scammerMessageText: string,
+  ): Promise<{ apiResponse: OutgoingResponsePayload; updatedSessionState: HoneypotSession }> => {
+    let agentReply = '';
+    let newScamDetected = currentSession.scamDetected;
+    let newScamType = currentSession.scamType;
+
+    // Add scammer's message to history first
+    const updatedHistory: Message[] = [
+      ...currentSession.conversationHistory,
+      { sender: 'scammer', text: scammerMessageText, timestamp: Date.now() },
+    ];
+
+    // Step 1: Detect scam intent or generate agent response
+    if (!currentSession.scamDetected) {
+      const detectionResult = await detectScamIntent(scammerMessageText, updatedHistory);
+      newScamDetected = detectionResult.isScam;
+      newScamType = detectionResult.scamType;
+      agentReply = detectionResult.isScam ? detectionResult.initialReply : DEFAULT_NON_SCAM_REPLY;
+    } else {
+      // If scam already detected, generate a multi-turn agent response
+      const response = await generateAgentResponse(updatedHistory, AGENT_PERSONA_DESCRIPTION);
+      agentReply = response.reply;
+    }
+
+    // Add agent's reply to history
+    const finalHistory: Message[] = [
+      ...updatedHistory,
+      { sender: 'honeypot', text: agentReply, timestamp: Date.now() },
+    ];
+
+    // Step 2: Extract intelligence (always run after each turn if scam detected)
+    let extractedData = currentSession.extractedIntelligence;
+    if (newScamDetected) {
+      extractedData = await extractIntelligence(finalHistory);
+    }
+
+    const updatedSessionState: HoneypotSession = {
+      ...currentSession,
+      conversationHistory: finalHistory,
+      scamDetected: newScamDetected,
+      scamType: newScamType,
+      totalMessagesExchanged: currentSession.totalMessagesExchanged + 2, // Scammer + Agent
+      extractedIntelligence: extractedData,
+    };
+
+    const apiResponse: OutgoingResponsePayload = {
+      status: 'success',
+      reply: agentReply,
+      scamDetected: newScamDetected,
+    };
+
+    return { apiResponse, updatedSessionState };
+  }, [session.conversationHistory, session.scamDetected, session.scamType]); // Removed 'session' from dependencies to avoid stale closures. Added specific session properties.
+
+
+  // Simulate a REST API endpoint
+  const simulateHoneypotApiEndpoint = useCallback(async (
+    request: { method: string; headers: Headers; json: () => Promise<IncomingMessagePayload> },
+    currentSession: HoneypotSession
+  ): Promise<{ status: number; body: OutgoingResponsePayload }> => {
+    // 1. Validate HTTP Method
+    if (request.method !== 'POST') {
+      return { status: 405, body: { status: 'error', reply: 'Method Not Allowed' } };
+    }
+
+    // 2. Validate API Key
+    const apiKey = request.headers.get(HONEYPOT_API_KEY_HEADER);
+    if (!apiKey || apiKey !== HONEYPOT_DEV_API_KEY) {
+      return { status: 401, body: { status: 'error', reply: 'Unauthorized: Invalid or missing API key' } };
+    }
+
+    // 3. Parse Request Body
+    let payload: IncomingMessagePayload;
+    try {
+      payload = await request.json();
+      if (!payload.sessionId || !payload.message?.text) {
+        throw new Error('Missing sessionId or message text in payload');
+      }
+    } catch (parseError) {
+      console.error('API Payload parsing error:', parseError);
+      return { status: 400, body: { status: 'error', reply: 'Bad Request: Invalid JSON payload' } };
+    }
+
+    // 4. Process Logic
+    try {
+      const { apiResponse, updatedSessionState } = await processHoneypotLogic(
+        currentSession,
+        payload.message.text
+      );
+      // The updatedSessionState is returned here, but the actual React state update happens in handleIncomingMessage
+      // This mimics a backend not directly manipulating client state.
+      return { status: 200, body: apiResponse };
+    } catch (logicError) {
+      console.error('Honeypot API logic error:', logicError);
+      return { status: 500, body: { status: 'error', reply: 'Internal Server Error during AI processing' } };
+    }
+  }, [processHoneypotLogic]);
+
+
+  const handleIncomingMessage = useCallback(async (scammerMessageText: string) => {
     setIsLoading(true);
     setError(null);
-    let agentReply = '';
-    let newScamDetected = session.scamDetected;
-    let newScamType = session.scamType;
 
     try {
-      // Add scammer's message to history first
-      const updatedHistory: Message[] = [
-        ...session.conversationHistory,
-        { sender: 'scammer', text: scammerMessageText, timestamp: Date.now() },
-      ];
+      // Simulate an incoming API request
+      const mockRequestHeaders = new Headers();
+      mockRequestHeaders.append(HONEYPOT_API_KEY_HEADER, HONEYPOT_DEV_API_KEY);
 
-      // Step 1: Detect scam intent or generate agent response
-      if (!session.scamDetected) {
-        const detectionResult = await detectScamIntent(scammerMessageText, updatedHistory);
-        newScamDetected = detectionResult.isScam;
-        newScamType = detectionResult.scamType;
-        agentReply = detectionResult.isScam ? detectionResult.initialReply : DEFAULT_NON_SCAM_REPLY;
+      const mockIncomingPayload: IncomingMessagePayload = {
+        sessionId: session.sessionId,
+        message: {
+          sender: 'scammer',
+          text: scammerMessageText,
+          timestamp: Date.now(),
+        },
+        conversationHistory: session.conversationHistory, // This is usually sent by the client for context
+        metadata: {
+          channel: 'UI-Simulated',
+          language: 'English',
+          locale: 'IN',
+        },
+      };
+
+      // Call the simulated API endpoint
+      const apiResponse = await simulateHoneypotApiEndpoint(
+        {
+          method: 'POST',
+          headers: mockRequestHeaders,
+          json: async () => mockIncomingPayload,
+        },
+        session // Pass the current session state to the simulated endpoint
+      );
+
+      if (apiResponse.status === 200 && apiResponse.body.status === 'success') {
+        // Update session state based on the successful API response
+        // Note: The simulated endpoint doesn't return the full updated session,
+        // so we re-run some logic locally or reconstruct based on reply.
+        // For simplicity and to ensure all local state is consistently updated:
+        const { updatedSessionState } = await processHoneypotLogic(session, scammerMessageText);
+        setSession(updatedSessionState);
+
       } else {
-        // If scam already detected, generate a multi-turn agent response
-        const response = await generateAgentResponse(updatedHistory, AGENT_PERSONA_DESCRIPTION);
-        agentReply = response.reply;
+        // Handle API errors
+        throw new Error(`API Error ${apiResponse.status}: ${apiResponse.body.reply}`);
       }
-
-      // Add agent's reply to history
-      const finalHistory: Message[] = [
-        ...updatedHistory,
-        { sender: 'honeypot', text: agentReply, timestamp: Date.now() },
-      ];
-
-      // Step 2: Extract intelligence (always run after each turn if scam detected)
-      let extractedData = session.extractedIntelligence;
-      if (newScamDetected) { // Only extract if scam detected
-        extractedData = await extractIntelligence(finalHistory);
-      }
-
-      // Step 3: Update session state
-      setSession((prevSession) => ({
-        ...prevSession,
-        conversationHistory: finalHistory,
-        scamDetected: newScamDetected,
-        scamType: newScamType,
-        totalMessagesExchanged: prevSession.totalMessagesExchanged + 2, // Scammer + Agent
-        extractedIntelligence: extractedData,
-      }));
-
-      return { status: 'success', reply: agentReply, scamDetected: newScamDetected };
     } catch (err) {
-      console.error('Honeypot API error:', err);
+      console.error('Honeypot UI interaction error:', err);
       const errorMessage = err instanceof Error ? err.message : String(err);
       setError(`Failed to process message: ${errorMessage}`);
-      return { status: 'error', reply: 'An internal error occurred. Please try again.', scamDetected: newScamDetected };
     } finally {
       setIsLoading(false);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session.conversationHistory, session.scamDetected, session.scamType]); // Fixed dependency array
+  }, [session, simulateHoneypotApiEndpoint, processHoneypotLogic]); // Added all necessary dependencies
+
 
   const handleEndEngagement = useCallback(async () => {
     if (session.status === 'completed' || isLoading) return;
@@ -176,7 +275,7 @@ const App: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  }, [session, isLoading]); // Fixed dependency array
+  }, [session, isLoading]);
 
   const handleResetSession = useCallback(() => {
     if (isLoading) return; // Prevent reset during an active operation

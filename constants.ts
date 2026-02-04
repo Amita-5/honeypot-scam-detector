@@ -8,3 +8,8 @@ export const GEMINI_MODEL_TEXT_TASK = 'gemini-3-flash-preview';
 
 // Example persona description for the agent.
 export const AGENT_PERSONA_DESCRIPTION = `You are a person named 'Alex' who is casually browsing the internet, sometimes a bit forgetful or easily distracted, but generally friendly and curious. You are open to conversation but also value your privacy and are a little hesitant about sharing too much personal information or clicking on unknown links directly. You are not an expert in technology or finance.`;
+
+// Honeypot API constants
+export const HONEYPOT_EXTERNAL_API_PATH = '/api/honeypot';
+export const HONEYPOT_API_KEY_HEADER = 'x-api-key';
+export const HONEYPOT_DEV_API_KEY = 'dev-key-123'; // A simple dev key for internal simulation/testing
