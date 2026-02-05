@@ -1,146 +1,127 @@
-import fetch from "node-fetch";
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
 
-/**
- * In-memory session state (sufficient for hackathon evaluation)
- */
-const sessionState = {};
-
-/**
- * Call Gemini safely
- */
-async function callGemini(prompt) {
   try {
-    const response = await fetch(
+    // ----------------------------------
+    // 1. Validate x-api-key (AUTH ONLY)
+    // ----------------------------------
+    const clientKey = req.headers["x-api-key"];
+
+    // You can change "dev-key" to anything you want
+    if (!clientKey || clientKey !== "dev-key") {
+      return res.status(401).json({
+        status: "error",
+        message: "Unauthorized: invalid x-api-key"
+      });
+    }
+
+    // ----------------------------------
+    // 2. Gemini key (SERVER ONLY)
+    // ----------------------------------
+    const geminiKey = process.env.GEMINI_API_KEY;
+
+    if (!geminiKey) {
+      return res.status(500).json({
+        status: "error",
+        message: "Gemini API key not configured on server"
+      });
+    }
+
+    const {
+      sessionId,
+      message,
+      conversationHistory = [],
+      metadata = {}
+    } = req.body || {};
+
+    if (!message || !message.text) {
+      return res.status(400).json({ error: "Invalid request body" });
+    }
+
+    // -------------------------------
+    // Conversation context builder
+    // -------------------------------
+    const historyText = conversationHistory
+      .map(m => `${m.sender.toUpperCase()}: ${m.text}`)
+      .join("\n");
+
+    const prompt = `
+You are a normal bank customer.
+You are chatting with someone who contacted you first.
+
+Rules:
+- Ask ONLY one short clarification question.
+- Be polite and human.
+- Do NOT share any personal, bank, OTP, or UPI details.
+- Do NOT mention scams, fraud, security systems, or AI.
+- Do NOT explain policies.
+- Adapt naturally based on the conversation.
+- If something feels unclear, ask for proof or explanation.
+
+Conversation so far:
+${historyText || "None"}
+
+Latest message from other person:
+"${message.text}"
+
+Reply as the customer:
+`;
+
+    // -------------------------------
+    // 3. Gemini API call
+    // -------------------------------
+    const geminiResponse = await fetch(
       "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=" +
-        process.env.GEMINI_API_KEY,
+        geminiKey,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }]
+          contents: [
+            {
+              parts: [{ text: prompt }]
+            }
+          ]
         })
       }
     );
 
-    const data = await response.json();
-    return data?.candidates?.[0]?.content?.parts?.[0]?.text || null;
-  } catch {
-    return null;
-  }
-}
+    const geminiData = await geminiResponse.json();
 
-export default async function handler(req, res) {
-  /* ------------------ AUTH ------------------ */
-  const apiKey = req.headers["x-api-key"];
-  if (!apiKey) return res.status(401).json({ error: "x-api-key missing" });
-  if (apiKey !== "dev-key") return res.status(403).json({ error: "Invalid API key" });
+    const geminiReply =
+      geminiData?.candidates?.[0]?.content?.parts
+        ?.map(p => p.text)
+        ?.join(" ")
+        ?.trim() || null;
 
-  /* ------------------ INPUT ------------------ */
-  const {
-    sessionId,
-    message,
-    conversationHistory = [],
-    metadata = {}
-  } = req.body;
+    // -------------------------------
+    // 4. Safe fallback
+    // -------------------------------
+    const fallbackReplies = [
+      "Why is this action required?",
+      "Can you explain this in more detail?",
+      "I haven’t received any official message about this.",
+      "What is the reason for this request?"
+    ];
 
-  const text = message?.text;
+    const reply =
+      geminiReply ||
+      fallbackReplies[Math.floor(Math.random() * fallbackReplies.length)];
 
-  if (!sessionId || !text) {
     return res.status(200).json({
       status: "success",
-      reply: "Can you explain what this message is about?"
+      reply
+    });
+
+  } catch (error) {
+    console.error("Detect API error:", error);
+    return res.status(500).json({
+      status: "error",
+      reply: "Can you please explain what this is regarding?"
     });
   }
-
-  /* ------------------ SESSION INIT ------------------ */
-  if (!sessionState[sessionId]) {
-    sessionState[sessionId] = {
-      turns: 0,
-      scamIndicators: new Set(),
-      requestedData: new Set(),
-      finalized: false
-    };
-  }
-
-  const state = sessionState[sessionId];
-  state.turns += 1;
-
-  /* ------------------ INTELLIGENCE EXTRACTION ------------------ */
-  const lower = text.toLowerCase();
-
-  if (/otp|one time password/.test(lower)) state.requestedData.add("OTP");
-  if (/upi|account number|bank|card/.test(lower)) state.requestedData.add("Bank Details");
-  if (/click|link|verify link/.test(lower)) state.scamIndicators.add("Phishing Link");
-  if (/urgent|blocked|suspended|hours|immediately/.test(lower))
-    state.scamIndicators.add("Threat / Urgency");
-  if (/won|prize|reward|lottery/.test(lower)) state.scamIndicators.add("Lottery Scam");
-
-  /* ------------------ GEMINI PROMPT (REAL INTELLIGENCE) ------------------ */
-  const historyText =
-    conversationHistory.length > 0
-      ? conversationHistory.map(m => `${m.sender}: ${m.text}`).join("\n")
-      : "No prior conversation.";
-
-  const geminiPrompt = `
-You are a real human who received suspicious messages.
-You are NOT an AI.
-You are NOT a security system.
-
-Rules:
-- Reply like a cautious normal person
-- Ask natural clarification questions
-- Do NOT share OTP, bank info, or personal data
-- Do NOT mention scams, fraud, police, or security
-- Do NOT explain policies or analysis
-- Reply with ONE short message only
-
-Conversation so far:
-${historyText}
-
-Latest message received:
-"${text}"
-
-Your reply:
-`;
-
-  const geminiReply = await callGemini(geminiPrompt);
-
-  const reply =
-    geminiReply && typeof geminiReply === "string"
-      ? geminiReply.trim()
-      : "Can you explain what you mean by this?";
-
-  /* ------------------ GUVI FINAL CALLBACK ------------------ */
-  if (!state.finalized && state.turns >= 3) {
-    state.finalized = true;
-
-    const intelligencePayload = {
-      sessionId,
-      scamDetected: true,
-      scamIndicators: Array.from(state.scamIndicators),
-      requestedSensitiveData: Array.from(state.requestedData),
-      channel: metadata.channel || "Unknown",
-      language: metadata.language || "Unknown",
-      locale: metadata.locale || "Unknown",
-      totalTurns: state.turns
-    };
-
-    try {
-      await fetch("https://hackathon.guvi.in/api/updateHoneyPotFinalResult", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(intelligencePayload)
-      });
-    } catch {
-      // silent by design (no leakage)
-    }
-  }
-
-  /* ------------------ FINAL RESPONSE ------------------ */
-  return res.status(200).json({
-    status: "success",
-    reply
-  });
 }
 
 
