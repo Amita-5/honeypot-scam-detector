@@ -1,63 +1,117 @@
 import fetch from "node-fetch";
 
+/**
+ * In-memory session store (hackathon-safe)
+ */
+const sessionState = {};
+
+async function generateGeminiReply(prompt) {
+  try {
+    const response = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=" +
+        process.env.GEMINI_API_KEY,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }]
+        })
+      }
+    );
+
+    const data = await response.json();
+    return data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  } catch {
+    return null;
+  }
+}
+
 export default async function handler(req, res) {
-  // 🔑 API key check (unchanged behavior)
   const apiKey = req.headers["x-api-key"];
 
-  if (!apiKey) {
-    return res.status(401).json({ error: "x-api-key missing" });
-  }
+  if (!apiKey) return res.status(401).json({ error: "x-api-key missing" });
+  if (apiKey !== "dev-key") return res.status(403).json({ error: "Invalid API key" });
 
-  if (apiKey !== "dev-key") {
-    return res.status(403).json({ error: "Invalid API key" });
-  }
+  const { sessionId, message, conversationHistory = [], metadata = {} } = req.body;
+  const text = message?.text;
 
-  // ✅ NEW REQUEST FORMAT SUPPORT
-  const latestMessage = req.body?.message?.text;
-
-  if (!latestMessage || typeof latestMessage !== "string") {
+  if (!sessionId || !text) {
     return res.status(200).json({
       status: "success",
-      reply: "Can you explain what this message is about?"
+      reply: "Can you explain this message?"
     });
   }
 
-  // 🤖 Ask Gemini to generate a SAFE honeypot-style reply
-  const response = await fetch(
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=" +
-      process.env.GEMINI_API_KEY,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              {
-                text: `
-You are a cautious user replying to a suspected scammer.
-Ask a neutral clarification question.
-Do NOT share personal info.
-Reply in one short sentence.
+  // ---------- INIT SESSION ----------
+  if (!sessionState[sessionId]) {
+    sessionState[sessionId] = {
+      turns: 0,
+      scamIndicators: new Set(),
+      requestedData: new Set(),
+      finalized: false
+    };
+  }
 
-Scammer message:
-"${latestMessage}"
-`
-              }
-            ]
-          }
-        ]
-      })
+  const state = sessionState[sessionId];
+  state.turns += 1;
+
+  // ---------- SCAM INTELLIGENCE EXTRACTION ----------
+  const lower = text.toLowerCase();
+
+  if (/otp|one time password/.test(lower)) state.requestedData.add("OTP");
+  if (/upi|account number|bank/.test(lower)) state.requestedData.add("Bank Details");
+  if (/link|click/.test(lower)) state.scamIndicators.add("Phishing Link");
+  if (/blocked|suspended|urgent|hours/.test(lower)) state.scamIndicators.add("Threat / Urgency");
+  if (/won|prize|reward/.test(lower)) state.scamIndicators.add("Lottery Scam");
+
+  // ---------- BASE HUMAN REPLY (SAFE FALLBACK) ----------
+  let baseReply;
+  if (state.turns === 1) baseReply = "Why is my account being suspended?";
+  else if (state.turns === 2) baseReply = "What exactly do you need to verify?";
+  else if (state.turns === 3) baseReply = "I haven’t received any official notification.";
+  else baseReply = "Can you share official confirmation for this request?";
+
+  // ---------- GEMINI REPHRASING (OPTIONAL) ----------
+  const geminiPrompt = `
+You are a cautious bank customer.
+Ask ONE short clarification question.
+Do NOT share personal information.
+Do NOT mention scams or security.
+Rephrase naturally:
+
+"${baseReply}"
+`;
+
+  const geminiReply = await generateGeminiReply(geminiPrompt);
+  const reply = geminiReply || baseReply;
+
+  // ---------- FINALIZATION + GUVI CALLBACK ----------
+  if (state.turns >= 4 && !state.finalized) {
+    state.finalized = true;
+
+    const intelligencePayload = {
+      sessionId,
+      scamDetected: true,
+      scamIndicators: Array.from(state.scamIndicators),
+      requestedSensitiveData: Array.from(state.requestedData),
+      channel: metadata.channel || "Unknown",
+      language: metadata.language || "Unknown",
+      locale: metadata.locale || "Unknown",
+      totalTurns: state.turns
+    };
+
+    try {
+      await fetch("https://hackathon.guvi.in/api/updateHoneyPotFinalResult", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(intelligencePayload)
+      });
+    } catch {
+      // Silent by design
     }
-  );
+  }
 
-  const data = await response.json();
-
-  const reply =
-    data?.candidates?.[0]?.content?.parts?.[0]?.text ||
-    "Why is my account being suspended?";
-
-  // ✅ FINAL REQUIRED OUTPUT FORMAT
+  // ---------- FINAL RESPONSE ----------
   return res.status(200).json({
     status: "success",
     reply
